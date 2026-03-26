@@ -1,4 +1,4 @@
-# FeatureFlow
+# Real-Time Feature Store with Point-in-Time Training
 
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Kafka](https://img.shields.io/badge/kafka-7.5-black.svg)
@@ -6,7 +6,9 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
 
-A production-grade ML feature store for real-time e-commerce user behavior features. FeatureFlow demonstrates the infrastructure that separates senior ML engineers from the rest: event-driven feature computation, dual-write online/offline stores, point-in-time correct training data generation, and automated training-serving consistency validation.
+Event-driven feature computation with point-in-time correct training data generation and online/offline consistency validation. Solves the production ML infrastructure problem that silently breaks more models than any modeling decision: **training-serving skew and label leakage**.
+
+> Point-in-time correctness is what separates feature stores (Feast, Hopsworks, Tecton) from Redis caches. This project implements it directly — the mechanism is transparent, testable, and carries a leakage audit on every training dataset build.
 
 ---
 
@@ -31,34 +33,42 @@ graph TD
 ```mermaid
 graph LR
     A[Label Events\nuser_id, item_id, timestamp, label] --> B[PIT Join]
-    C[Offline Feature Store\nhistorical snapshots] --> B
+    C[Offline Store\nhistorical snapshots] --> B
     B --> D{For each label event\nfind latest features\nSTRICTLY BEFORE timestamp}
     D -->|Found| E[Attach Feature Values\nas of label timestamp]
-    D -->|Not found| F[Drop Row\ncold start]
-    E --> G[Training Dataset\nno data leakage]
+    D -->|Not found| F[Drop Row — cold start]
+    E --> G[Training Dataset\nzero data leakage]
 ```
+
+---
+
+## Why This Matters
+
+**Label leakage** is invisible until deployment. A purchase on June 1st is labeled as a positive, but `purchase_count_24h` at training time includes activity from June 15th if you join at training time (say, June 30th). Offline metrics look great; production performance is much worse.
+
+**Training-serving skew** is the other side: the feature named `purchase_count_24h` in your training data is computed differently from what the model receives at inference — different windows, different aggregation, different code paths.
+
+FeatureFlow addresses both:
+- **Dual-write**: the stream processor writes to Redis and Parquet in the same pass, from the same computation. One codebase, one feature definition.
+- **Point-in-time joins**: every training row is joined to features computed strictly before the label event's timestamp.
+- **Leakage validation**: `validate_no_leakage()` audits every training dataset before it leaves the builder.
+- **Consistency checking**: `ConsistencyChecker` compares online (Redis) and offline (Parquet) values per feature and flags discrepancies above a configurable threshold.
 
 ---
 
 ## Key Design Decisions
 
-### Why point-in-time correctness matters
+**Why Kafka over Redis Streams or SQS?**
+Kafka provides a durable, ordered, replayable log. When you define a new feature, you replay historical events from any offset to backfill it — no re-instrumentation, no waiting for fresh data. Redis Streams and SQS do not support arbitrary-offset historical replay. For feature stores, replay is the mechanism for backfilling new features without gaps.
 
-Without it, you have label leakage: training uses features computed from the future relative to the label event. A purchase that happened *after* the model prediction window gets folded into the features used to predict that purchase. Models trained this way produce inflated offline metrics and terrible production performance. This is one of the most common and hardest-to-catch bugs in ML systems — it is invisible until you deploy.
+**Why partition by user_id?**
+All events for a given user land on the same partition, in order. The stream processor sees a user's complete event history without cross-partition coordination. Windowed aggregations (`purchases in last 1h`) are correct by construction. Random partitioning would require distributed state or a separate aggregation layer.
 
-FeatureFlow solves this by storing timestamped feature snapshots to the offline store at regular intervals and joining each training row to the most recent snapshot that predates the label event's timestamp by a strictly-less-than comparison.
+**Why dual-write from the same computation?**
+Separate codepaths for training vs. serving diverge over time. Schema changes get applied in one place but not the other. The safest guarantee is one computation that writes both. The stream processor is the single source of truth for all feature values.
 
-### Why separate online and offline stores
-
-The dual-write architecture writes to both Redis (online) and Parquet (offline) from the same computation pass — the same code, the same input events, the same moment in time. This is the only way to guarantee that what the model was trained on matches what it sees at inference. Using different code paths or different data sources for training vs. serving is the root cause of training-serving skew.
-
-### Why Kafka for event ingestion
-
-Kafka provides a durable, ordered, replayable event log. When you define a new feature, you can replay historical events from any offset to backfill it — without re-instrumenting the application or waiting for new data to accumulate. Redis Streams, SQS, or a message queue cannot offer arbitrary-offset replay from months of history.
-
-### Why partition Kafka by user_id
-
-All events for a given user land on the same partition. This means the stream processor sees a user's events in order without any cross-partition coordination or distributed locking. Windowed aggregations (purchases in the last 1h) are correct by construction. If events were distributed randomly across partitions, a single consumer would see a partial view of each user's history.
+**Why daily Parquet partitions by entity?**
+PIT joins scan features over a date range. Daily partitions (`entity=user/date=2024-01-15/`) mean the join only reads the partitions overlapping with label event timestamps — no full scan. For large corpora this is the difference between seconds and minutes.
 
 ---
 
@@ -66,31 +76,31 @@ All events for a given user land on the same partition. This means the stream pr
 
 ### User Features
 
-| Feature | Window | Type | Description |
-|---|---|---|---|
-| `purchase_count_1h` | 1h | int | Purchases in last 1 hour |
-| `purchase_count_24h` | 24h | int | Purchases in last 24 hours |
-| `item_view_count_1h` | 1h | int | Item views in last 1 hour |
-| `item_view_count_24h` | 24h | int | Item views in last 24 hours |
-| `cart_count_1h` | 1h | int | Add-to-cart events in last 1 hour |
-| `total_spend_24h` | 24h | float | Total purchase amount in last 24 hours |
-| `avg_session_duration` | all-time | float | Average session duration in minutes |
-| `conversion_rate_7d` | 7d | float | Purchase / item_view ratio in last 7 days |
-| `category_affinity` | 24h | list | Top 3 item categories by view count |
-| `days_since_last_purchase` | all-time | float | Days since most recent purchase |
+| Feature | Window | Description |
+|---|---|---|
+| `purchase_count_1h` | 1h | Purchases in last 1 hour |
+| `purchase_count_24h` | 24h | Purchases in last 24 hours |
+| `item_view_count_1h` | 1h | Item views in last 1 hour |
+| `item_view_count_24h` | 24h | Item views in last 24 hours |
+| `cart_count_1h` | 1h | Add-to-cart events in last 1 hour |
+| `total_spend_24h` | 24h | Total purchase amount in last 24 hours |
+| `avg_session_duration` | rolling | Average session duration (minutes) |
+| `conversion_rate_7d` | 7d | Purchase / item_view ratio |
+| `category_affinity` | 24h | Top 3 categories by view count |
+| `days_since_last_purchase` | rolling | Days since most recent purchase |
 
 ### Item Features
 
-| Feature | Window | Type | Description |
-|---|---|---|---|
-| `view_count_1h` | 1h | int | Item views in last 1 hour |
-| `view_count_24h` | 24h | int | Item views in last 24 hours |
-| `purchase_count_24h` | 24h | int | Purchases in last 24 hours |
-| `cart_add_count_1h` | 1h | int | Add-to-cart events in last 1 hour |
-| `avg_rating` | all-time | float | Average user rating |
-| `conversion_rate_24h` | 24h | float | Purchase / view ratio in last 24 hours |
-| `revenue_24h` | 24h | float | Total revenue in last 24 hours |
-| `popularity_rank_1h` | 1h | float | Relative popularity rank (0–1) |
+| Feature | Window | Description |
+|---|---|---|
+| `view_count_1h` | 1h | Item views in last 1 hour |
+| `view_count_24h` | 24h | Item views in last 24 hours |
+| `purchase_count_24h` | 24h | Purchases in last 24 hours |
+| `cart_add_count_1h` | 1h | Add-to-cart events in last 1 hour |
+| `avg_rating` | rolling | Average user rating |
+| `conversion_rate_24h` | 24h | Purchase / view ratio |
+| `revenue_24h` | 24h | Total revenue in last 24 hours |
+| `popularity_rank_1h` | 1h | Relative popularity rank (0–1) |
 
 ---
 
@@ -98,13 +108,13 @@ All events for a given user land on the same partition. This means the stream pr
 
 | Capability | Implementation |
 |---|---|
-| Point-in-time correctness | `PointInTimeDatasetBuilder` — as-of joins with strict timestamp ordering |
-| Dual-write consistency | `StreamProcessor` writes online + offline from the same computation |
-| Leakage detection | `validate_no_leakage` in `dataset_builder.py` |
-| Training-serving skew | `ConsistencyChecker` — compares Redis vs Parquet values |
+| Point-in-time correctness | `PointInTimeDatasetBuilder` — strict timestamp ordering, no future leakage |
+| Dual-write consistency | `StreamProcessor` writes Redis + Parquet in one pass |
+| Leakage detection | `validate_no_leakage()` audits every training dataset |
+| Training-serving skew | `ConsistencyChecker` — compares Redis vs Parquet per feature |
 | Real-time serving | FastAPI + Redis pipeline, target <5ms for `/features/vector` |
-| Offline materialisation | `BatchProcessor` — hourly Parquet snapshots, backfill support |
-| Feature registry | `FeatureRegistry` — single source of truth for feature metadata |
+| Offline materialization | `BatchProcessor` — hourly Parquet snapshots, backfill support |
+| Feature registry | `FeatureRegistry` — single source of truth for metadata and TTLs |
 | Observability | Prometheus metrics + Grafana dashboard |
 
 ---
@@ -112,74 +122,45 @@ All events for a given user land on the same partition. This means the stream pr
 ## Quickstart
 
 ```bash
-# 1. Install dependencies
-make install
-
-# 2. Start Kafka, Redis, API, Prometheus, Grafana
-make docker-up
-
-# 3. Produce 10,000 synthetic events to Kafka
-make produce
-
-# 4. Run the stream processor (in a separate terminal)
-make process
+make install      # install dependencies
+make docker-up    # Kafka, Redis, API :8000, Prometheus :9090, Grafana :3000
+make produce      # stream 10,000 synthetic events into Kafka
+make process      # start stream processor (separate terminal)
 ```
 
-Then explore:
-- Feature serving API: http://localhost:8000/docs
-- Prometheus metrics: http://localhost:9090
-- Grafana dashboard: http://localhost:3000 (admin / featureflow)
-
-### Build a training dataset without Kafka/Redis
-
+Build a training dataset offline (no Kafka/Redis needed):
 ```bash
 make build-dataset
-# Outputs: data/training_dataset.csv
+# outputs: data/training_dataset.csv
+# runs: event generation → hourly snapshots → PIT join → leakage audit
 ```
-
-This runs entirely offline: generates events, materialises hourly snapshots to Parquet, runs the point-in-time join, and validates no leakage.
 
 ---
 
 ## Point-in-Time Join
 
-The `PointInTimeDatasetBuilder` is the most critical component for ML correctness.
-
-**The problem:** You have 100,000 label events (purchases, ratings) spread over 30 days. You want to attach each entity's features to each label row. The naive approach is to join on `user_id` and attach the *current* feature values. This creates leakage: a user's feature for "total spend in last 24h" on June 1st will include purchases from June 15th if you join at training time (say, June 30th).
-
-**The solution:** For each label event at time T:
-1. Read all feature snapshots for that entity from the offline store.
-2. Filter to snapshots where `snapshot_timestamp < T` (strictly before).
-3. Take the most recent surviving snapshot.
-4. Attach those feature values.
-
-This is what Feast, Hopsworks, and Tecton do internally. FeatureFlow implements it directly so the mechanism is transparent.
-
 ```python
+from src.training.dataset_builder import PointInTimeDatasetBuilder
+
 builder = PointInTimeDatasetBuilder(offline_store, registry)
 dataset = builder.build(
-    label_events=label_df,           # user_id, item_id, timestamp, label
+    label_events=label_df,
     user_features=["purchase_count_24h", "conversion_rate_7d"],
     item_features=["avg_rating", "view_count_24h"],
 )
 report = builder.validate_no_leakage(dataset, label_df)
-assert report.passed  # "PASSED" means zero leakage violations
+assert report.passed
+print(report.summary())
+# LeakageReport [PASSED] rows_kept=94821 rows_dropped=5179 violations=0
 ```
-
-Rows with no feature history before the label timestamp are dropped (cold start). The `LeakageReport` tells you exactly how many rows were kept and whether any violations were detected.
 
 ---
 
 ## Consistency Checker
 
-The `ConsistencyChecker` detects training-serving skew — the case where the feature named `purchase_count_24h` means something different in Redis (what the model receives at inference) versus in Parquet (what the model was trained on).
-
-This happens silently when:
-- A feature definition changes (different window, different aggregation) but old values remain in Redis
-- The stream processor has a bug that affects one store but not the other
-- Offline backfill uses different logic than the stream processor
-
 ```python
+from src.consistency.checker import ConsistencyChecker
+
 checker = ConsistencyChecker(offline_store, online_store)
 report = checker.check(
     entity="user",
@@ -187,10 +168,24 @@ report = checker.check(
     feature_names=["purchase_count_24h", "total_spend_24h"],
 )
 print(report.summary())
-# ConsistencyReport [PASSED] entity=user checked=500 flagged_features=[none]
+# ConsistencyReport [PASSED] entity=user checked=500 flagged_features=[]
 ```
 
-A feature is flagged when more than 5% of sampled entities have online/offline values differing by more than 5% (relative). The thresholds are configurable in `consistency/checker.py`.
+A feature is flagged when > 5% of sampled entities have online/offline values differing by > 5% relative.
+
+---
+
+## API Reference
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/features/vector` | POST | Full feature vector for a user — <5ms hot path |
+| `/features/user/{id}` | GET | All features for a user entity |
+| `/features/item/{id}` | GET | All features for an item entity |
+| `/features/batch` | POST | Batch feature lookup |
+| `/registry` | GET | Feature catalog with TTLs and metadata |
+| `/health` | GET | Service readiness |
+| `/metrics` | GET | Prometheus scrape endpoint |
 
 ---
 
@@ -199,42 +194,35 @@ A feature is flagged when more than 5% of sampled entities have online/offline v
 ```
 featureflow/
 ├── src/
-│   ├── config.py                  # Pydantic settings
 │   ├── events/
-│   │   ├── schema.py              # UserEvent dataclass + Pydantic model
-│   │   └── generator.py           # Realistic event stream simulator
+│   │   ├── schema.py           # UserEvent dataclass + Pydantic model
+│   │   └── generator.py        # Realistic event stream simulator
 │   ├── kafka/
-│   │   ├── producer.py            # Kafka producer (keyed by user_id)
-│   │   └── consumer.py            # Kafka consumer with error isolation
+│   │   ├── producer.py         # Keyed by user_id
+│   │   └── consumer.py         # Batch consumer with error isolation
 │   ├── features/
-│   │   ├── definitions.py         # FeatureDefinition catalog
-│   │   ├── transformations.py     # Pure, stateless feature functions
-│   │   └── registry.py            # Singleton feature registry
+│   │   ├── definitions.py      # Feature catalog with windows and TTLs
+│   │   ├── transformations.py  # Pure, stateless transformation functions
+│   │   └── registry.py         # Singleton feature registry
 │   ├── stores/
-│   │   ├── online_store.py        # Redis — pipeline reads, per-feature TTL
-│   │   └── offline_store.py       # Parquet — partitioned by entity + date
+│   │   ├── online_store.py     # Redis — pipelined reads, per-feature TTL
+│   │   └── offline_store.py    # Parquet — entity/date partitions
 │   ├── pipeline/
-│   │   ├── stream_processor.py    # Kafka → features → dual-write
-│   │   └── batch_processor.py     # Historical backfill with hourly snapshots
+│   │   ├── stream_processor.py # Kafka → features → dual-write
+│   │   └── batch_processor.py  # Historical backfill, hourly snapshots
 │   ├── training/
-│   │   └── dataset_builder.py     # Point-in-time join + leakage validation
+│   │   └── dataset_builder.py  # PIT join + leakage validation
 │   ├── serving/
-│   │   ├── app.py                 # FastAPI — <5ms /features/vector hot path
-│   │   └── middleware.py          # Prometheus instrumentation
+│   │   ├── app.py              # FastAPI
+│   │   └── middleware.py       # Prometheus instrumentation
 │   └── consistency/
-│       └── checker.py             # Training-serving skew detection
+│       └── checker.py          # Training-serving skew detection
 ├── scripts/
-│   ├── produce_events.py          # CLI event producer
-│   ├── run_processor.py           # CLI stream processor
-│   └── build_training_set.py      # CLI training dataset builder
+│   ├── produce_events.py
+│   ├── run_processor.py
+│   └── build_training_set.py
 ├── tests/
-│   ├── test_features.py
-│   ├── test_stores.py
-│   ├── test_pit_join.py
-│   └── test_consistency.py
 └── monitoring/
-    ├── prometheus.yml
-    └── grafana/dashboard.json
 ```
 
 ---
@@ -245,14 +233,7 @@ featureflow/
 make test
 ```
 
-Tests are fully self-contained: no Kafka or Redis required. The online store uses an in-memory fallback when Redis is unavailable, and the offline store writes to `tempfile` directories.
-
-```
-tests/test_features.py       — transformation function correctness
-tests/test_stores.py         — read/write round-trips for both stores
-tests/test_pit_join.py       — point-in-time join correctness + leakage detection
-tests/test_consistency.py    — skew detection sensitivity and accuracy
-```
+Tests are fully self-contained — no Kafka or Redis required. Online store uses an in-memory fallback; offline store writes to `tempfile` directories.
 
 ---
 
