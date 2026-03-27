@@ -6,7 +6,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
 
-Event-driven feature computation with point-in-time correct training data generation and online/offline consistency validation. Solves the production ML infrastructure problem that silently breaks more models than any modeling decision: **training-serving skew and label leakage**.
+Event-driven feature computation with point-in-time correct training data generation and online/offline consistency validation. Solves training-serving skew and label leakage — the infrastructure problems that silently break more models than any modeling decision.
 
 > Point-in-time correctness is what separates feature stores (Feast, Hopsworks, Tecton) from Redis caches. This project implements it directly — the mechanism is transparent, testable, and carries a leakage audit on every training dataset build.
 
@@ -42,33 +42,15 @@ graph LR
 
 ---
 
-## Why This Matters
-
-**Label leakage** is invisible until deployment. A purchase on June 1st is labeled as a positive, but `purchase_count_24h` at training time includes activity from June 15th if you join at training time (say, June 30th). Offline metrics look great; production performance is much worse.
-
-**Training-serving skew** is the other side: the feature named `purchase_count_24h` in your training data is computed differently from what the model receives at inference — different windows, different aggregation, different code paths.
-
-FeatureFlow addresses both:
-- **Dual-write**: the stream processor writes to Redis and Parquet in the same pass, from the same computation. One codebase, one feature definition.
-- **Point-in-time joins**: every training row is joined to features computed strictly before the label event's timestamp.
-- **Leakage validation**: `validate_no_leakage()` audits every training dataset before it leaves the builder.
-- **Consistency checking**: `ConsistencyChecker` compares online (Redis) and offline (Parquet) values per feature and flags discrepancies above a configurable threshold.
-
----
-
 ## Key Design Decisions
 
-**Why Kafka over Redis Streams or SQS?**
-Kafka provides a durable, ordered, replayable log. When you define a new feature, you replay historical events from any offset to backfill it — no re-instrumentation, no waiting for fresh data. Redis Streams and SQS do not support arbitrary-offset historical replay. For feature stores, replay is the mechanism for backfilling new features without gaps.
+**Kafka over Redis Streams or SQS:** Kafka's durable, replayable log lets you backfill new features from any historical offset without re-instrumentation. Redis Streams and SQS don't support arbitrary-offset replay.
 
-**Why partition by user_id?**
-All events for a given user land on the same partition, in order. The stream processor sees a user's complete event history without cross-partition coordination. Windowed aggregations (`purchases in last 1h`) are correct by construction. Random partitioning would require distributed state or a separate aggregation layer.
+**Partition by user_id:** All events for a user land on the same partition in order. Windowed aggregations are correct by construction — no cross-partition coordination needed.
 
-**Why dual-write from the same computation?**
-Separate codepaths for training vs. serving diverge over time. Schema changes get applied in one place but not the other. The safest guarantee is one computation that writes both. The stream processor is the single source of truth for all feature values.
+**Dual-write from the same computation:** One stream processor writes both Redis and Parquet. No divergent codepaths, no skew from schema changes applied in one place but not the other.
 
-**Why daily Parquet partitions by entity?**
-PIT joins scan features over a date range. Daily partitions (`entity=user/date=2024-01-15/`) mean the join only reads the partitions overlapping with label event timestamps — no full scan. For large corpora this is the difference between seconds and minutes.
+**Daily Parquet partitions by entity:** PIT joins scan only the partitions overlapping with label event timestamps. Full scan avoided; at scale this is seconds vs. minutes.
 
 ---
 
