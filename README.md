@@ -1,4 +1,4 @@
-# Real-Time Feature Store with Point-in-Time Training
+# Real-Time Feature Store
 
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Kafka](https://img.shields.io/badge/kafka-7.5-black.svg)
@@ -6,9 +6,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
 
-Event-driven feature computation with point-in-time correct training data generation and online/offline consistency validation. Solves training-serving skew and label leakage — the infrastructure problems that silently break more models than any modeling decision.
-
-> Point-in-time correctness is what separates feature stores (Feast, Hopsworks, Tecton) from Redis caches. This project implements it directly — the mechanism is transparent, testable, and carries a leakage audit on every training dataset build.
+Event-driven feature computation. Includes point-in-time correct training data generation and online/offline consistency validation.
 
 ---
 
